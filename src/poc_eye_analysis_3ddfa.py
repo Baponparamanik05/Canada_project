@@ -7,6 +7,29 @@ import winsound
 from collections import deque
 import mediapipe as mp
 import numpy as np
+import sys
+import math
+
+# ============================================================
+# 3DDFA-V2 INTEGRATION
+# ============================================================
+# The 3DDFA-V2 folder is kept inside the project root:
+# D:\SleepingEyeDetection\3DDFA_V2
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+THREEDFA_ROOT = os.path.join(PROJECT_ROOT, "3DDFA_V2")
+
+THREEDFA_AVAILABLE = False
+THREEDFA_IMPORT_ERROR = None
+
+if os.path.isdir(THREEDFA_ROOT) and THREEDFA_ROOT not in sys.path:
+    sys.path.insert(0, THREEDFA_ROOT)
+
+try:
+    from TDDFA_ONNX import TDDFA_ONNX
+    THREEDFA_AVAILABLE = True
+except Exception as _e:
+    THREEDFA_IMPORT_ERROR = repr(_e)
+    TDDFA_ONNX = None
 
 try:
     from plyer import notification
@@ -23,6 +46,24 @@ MODEL_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "models",
     "face_landmarker.task"
+)
+
+THREEDFA_CHECKPOINT = os.path.join(
+    THREEDFA_ROOT,
+    "weights",
+    "mb1_120x120.pth"
+)
+
+THREEDFA_ONNX = os.path.join(
+    THREEDFA_ROOT,
+    "weights",
+    "mb1_120x120.onnx"
+)
+
+THREEDFA_BFM = os.path.join(
+    THREEDFA_ROOT,
+    "configs",
+    "bfm_noneck_v3.pkl"
 )
 
 CAMERA_INDEX = 0
@@ -531,6 +572,233 @@ def eye_box(
 
 
 # ============================================================
+# 3DDFA-V2 HEAD POSE
+# ============================================================
+
+def _landmarks_to_face_box(landmarks, width, height):
+    """Convert MediaPipe face landmarks to a safe [x1,y1,x2,y2] box."""
+    try:
+        xs = np.array(
+            [float(lm.x) * width for lm in landmarks],
+            dtype=np.float32
+        )
+        ys = np.array(
+            [float(lm.y) * height for lm in landmarks],
+            dtype=np.float32
+        )
+
+        valid = (
+            np.isfinite(xs)
+            & np.isfinite(ys)
+            & (xs >= -0.2 * width)
+            & (xs <= 1.2 * width)
+            & (ys >= -0.2 * height)
+            & (ys <= 1.2 * height)
+        )
+
+        if not np.any(valid):
+            return None
+
+        x1 = float(np.min(xs[valid]))
+        y1 = float(np.min(ys[valid]))
+        x2 = float(np.max(xs[valid]))
+        y2 = float(np.max(ys[valid]))
+
+        # Add a small margin so 3DDFA receives the complete face.
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        pad_x = 0.12 * bw
+        pad_y = 0.12 * bh
+
+        x1 = max(0.0, x1 - pad_x)
+        y1 = max(0.0, y1 - pad_y)
+        x2 = min(float(width - 1), x2 + pad_x)
+        y2 = min(float(height - 1), y2 + pad_y)
+
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+    except Exception:
+        return None
+
+
+def initialize_3ddfa():
+    """
+    Load 3DDFA-V2 once.
+
+    IMPORTANT:
+    We intentionally do NOT call recon_vers() here.  For this POC we only
+    need the 62-D 3DMM parameters for head pose.  This avoids the previous
+    tuple/index errors from treating reconstructed vertices as if they had
+    a different shape.
+    """
+    if not THREEDFA_AVAILABLE:
+        print("3DDFA-V2 import unavailable:", THREEDFA_IMPORT_ERROR)
+        return None
+
+    if not os.path.exists(THREEDFA_CHECKPOINT):
+        print("3DDFA checkpoint not found:")
+        print(" ", THREEDFA_CHECKPOINT)
+        return None
+
+    if not os.path.exists(THREEDFA_ONNX):
+        print("3DDFA ONNX model not found:")
+        print(" ", THREEDFA_ONNX)
+        return None
+
+    if not os.path.exists(THREEDFA_BFM):
+        print("3DDFA BFM model not found:")
+        print(" ", THREEDFA_BFM)
+        return None
+
+    try:
+        print("Loading 3DDFA-V2 ONNX pose model...")
+
+        tddfa = TDDFA_ONNX(
+            checkpoint_fp=THREEDFA_CHECKPOINT,
+            bfm_fp=THREEDFA_BFM,
+            onnx_fp=THREEDFA_ONNX,
+            size=120,
+            gpu_mode=False
+        )
+
+        # Verify that the ONNX inference session is actually usable.
+        if not hasattr(tddfa, "session"):
+            raise RuntimeError("TDDFA_ONNX session was not created.")
+
+        print("3DDFA-V2 ONNX pose model loaded.")
+        print("3DDFA model:", THREEDFA_ONNX)
+        return tddfa
+
+    except Exception as exc:
+        print("=" * 60)
+        print("3DDFA-V2 could not be loaded.")
+        print("The program will fall back to MediaPipe/OpenCV pose.")
+        print("3DDFA error:", repr(exc))
+        print("=" * 60)
+        return None
+
+
+def _p2srt(P):
+    """Decompose the first 12 3DDFA parameters into scale, rotation and translation."""
+    P = np.asarray(P, dtype=np.float64).reshape(3, 4)
+
+    R1 = P[0, :3]
+    R2 = P[1, :3]
+
+    s = (np.linalg.norm(R1) + np.linalg.norm(R2)) / 2.0
+
+    if s < 1e-9:
+        raise ValueError("Invalid 3DDFA pose scale.")
+
+    r1 = R1 / s
+    r2 = R2 / s
+    r1 = r1 / max(np.linalg.norm(r1), 1e-12)
+
+    # Orthogonalize the second row.
+    r2 = r2 - np.dot(r1, r2) * r1
+    r2 = r2 / max(np.linalg.norm(r2), 1e-12)
+
+    r3 = np.cross(r1, r2)
+    r3 = r3 / max(np.linalg.norm(r3), 1e-12)
+
+    R = np.vstack([r1, r2, r3])
+    t3d = P[:, 3]
+
+    return float(s), R, t3d
+
+
+def _matrix_to_angle(R):
+    """Same Euler-angle convention used by 3DDFA-V2 utils.pose."""
+    R = np.asarray(R, dtype=np.float64)
+
+    if R[2, 0] > 0.998:
+        z = 0.0
+        x = np.pi / 2.0
+        y = z + math.atan2(-R[0, 1], -R[0, 2])
+    elif R[2, 0] < -0.998:
+        z = 0.0
+        x = -np.pi / 2.0
+        y = -z + math.atan2(R[0, 1], R[0, 2])
+    else:
+        x = math.asin(float(R[2, 0]))
+        cx = max(abs(math.cos(x)), 1e-12)
+        y = math.atan2(float(R[2, 1]) / cx, float(R[2, 2]) / cx)
+        z = math.atan2(float(R[1, 0]) / cx, float(R[0, 0]) / cx)
+
+    return x, y, z
+
+
+def _calc_pose_local(param):
+    """
+    Calculate yaw/pitch/roll directly from 3DDFA's 62-D parameter vector.
+
+    This is the same calculation used by the official 3DDFA-V2 pose utility,
+    but is kept local so a missing/broken utils.pose import cannot force the
+    whole application into FALLBACK mode.
+    """
+    param = np.asarray(param, dtype=np.float64).reshape(-1)
+
+    if param.size < 12:
+        raise ValueError(f"3DDFA returned only {param.size} parameters; expected >= 12.")
+
+    P = param[:12].reshape(3, 4)
+    _, R, _ = _p2srt(P)
+    angles = _matrix_to_angle(R)
+
+    # Official 3DDFA order: x/y/z rotation in degrees.
+    pose = tuple(float(v * 180.0 / np.pi) for v in angles)
+
+    return pose
+
+
+def estimate_head_pose_3ddfa(tddfa, frame, landmarks):
+    """
+    Estimate head pose using 3DDFA-V2.
+
+    Returns:
+        yaw, pitch, roll, success
+    """
+    if tddfa is None:
+        return 0.0, 0.0, 0.0, False
+
+    try:
+        height, width = frame.shape[:2]
+        face_box = _landmarks_to_face_box(landmarks, width, height)
+
+        if face_box is None:
+            return 0.0, 0.0, 0.0, False
+
+        param_lst, roi_box_lst = tddfa(frame, [face_box])
+
+        if not param_lst:
+            return 0.0, 0.0, 0.0, False
+
+        param = np.asarray(param_lst[0]).reshape(-1)
+
+        yaw, pitch, roll = _calc_pose_local(param)
+
+        if not all(math.isfinite(v) for v in (yaw, pitch, roll)):
+            return 0.0, 0.0, 0.0, False
+
+        return (
+            float(np.clip(yaw, -180.0, 180.0)),
+            float(np.clip(pitch, -180.0, 180.0)),
+            float(np.clip(roll, -180.0, 180.0)),
+            True
+        )
+
+    except Exception as exc:
+        # The caller can use the existing MediaPipe/OpenCV pose for this frame.
+        # Store the last error for diagnostics without flooding the terminal.
+        global THREEDFA_LAST_ERROR
+        THREEDFA_LAST_ERROR = repr(exc)
+        return 0.0, 0.0, 0.0, False
+
+
+# ============================================================
 # HEAD POSE ESTIMATION
 # ============================================================
 
@@ -937,6 +1205,10 @@ def main():
     # INITIALIZATION
     # ========================================================
 
+    # 3DDFA is used only for 3D head pose. MediaPipe remains responsible
+    # for the eye landmarks/blink analysis.
+    tddfa = initialize_3ddfa()
+
     left_classifier = EyeClassifier()
 
     right_classifier = EyeClassifier()
@@ -991,6 +1263,13 @@ def main():
 
     last_timestamp = -1
 
+    # Latest 3DDFA pose values for diagnostics/HUD.
+    pose_yaw = 0.0
+    pose_pitch = 0.0
+    pose_roll = 0.0
+    pose_3ddfa_ok = False
+    last_pose_error_print = 0.0
+
     # ========================================================
     # CONSOLE
     # ========================================================
@@ -1016,6 +1295,10 @@ def main():
 
     print(
         "A poorly visible eye at a head angle is NOT VISIBLE, never CLOSED."
+    )
+
+    print(
+        "3DDFA-V2 = 3D head pose | MediaPipe = eye landmarks/blinks"
     )
 
     print(
@@ -1184,11 +1467,46 @@ def main():
                     # Used only to protect eye classification when
                     # the head is strongly raised/lowered.
 
-                    head_pitch = estimate_head_pitch(
-                        landmarks,
-                        width,
-                        height
+                    # ------------------------------------------------
+                    # 3DDFA-V2 HEAD POSE
+                    # ------------------------------------------------
+                    # 3DDFA is used for pose only.  We deliberately do not
+                    # reconstruct the full 3D mesh here, so the previous
+                    # IndexError/tuple-shape problem cannot occur.
+
+                    (
+                        pose_yaw,
+                        pose_pitch,
+                        pose_roll,
+                        pose_3ddfa_ok
+                    ) = estimate_head_pose_3ddfa(
+                        tddfa,
+                        frame,
+                        landmarks
                     )
+
+                    if pose_3ddfa_ok:
+                        head_pitch = pose_pitch
+                    else:
+                        # Print the real 3DDFA inference error once every 3s.
+                        now_pose = time.time()
+                        if (
+                            THREEDFA_LAST_ERROR
+                            and now_pose - last_pose_error_print > 3.0
+                        ):
+                            print(
+                                "3DDFA pose inference error:",
+                                THREEDFA_LAST_ERROR
+                            )
+                            last_pose_error_print = now_pose
+
+                        # Safe fallback to the original MediaPipe/OpenCV
+                        # pose estimator if 3DDFA misses one frame.
+                        head_pitch = estimate_head_pitch(
+                            landmarks,
+                            width,
+                            height
+                        )
 
                     # =================================================
                     # CALIBRATION
@@ -1707,11 +2025,42 @@ def main():
                     1
                 )
 
+                cv2.line(
+                    display,
+                    (panel_x + 10, y + 94),
+                    (width - 20, y + 94),
+                    (90, 90, 90),
+                    1
+                )
+
+                pose_status = "3DDFA" if pose_3ddfa_ok else "FALLBACK"
+
+                draw_text(
+                    display,
+                    f"● HEAD POSE     {pose_status}",
+                    (
+                        panel_x + 15,
+                        y + 76
+                    ),
+                    0.34,
+                    (70, 230, 90) if pose_3ddfa_ok else (0, 165, 255),
+                    1
+                )
+
                 # =================================================
                 # EYE ANALYSIS
                 # =================================================
 
-                y = 125
+                # Start eye analysis lower so it does not overlap the system-status rows.
+                y = 150
+
+                cv2.line(
+                    display,
+                    (panel_x + 10, y - 18),
+                    (width - 20, y - 18),
+                    (90, 90, 90),
+                    1
+                )
 
                 draw_text(
                     display,
@@ -1917,10 +2266,66 @@ def main():
                     )
 
                     # =================================================
+                    # HEAD POSE SECTION
+                    # =================================================
+
+                    # Keep head-pose information in its own section below
+                    # the eye-analysis values, matching the requested HUD
+                    # layout.
+                    # Keep a clear gap after the eye-analysis metrics.
+                    pose_section_y = y + 210
+
+                    cv2.line(
+                        display,
+                        (panel_x + 10, pose_section_y - 18),
+                        (width - 20, pose_section_y - 18),
+                        (90, 90, 90),
+                        1
+                    )
+
+                    draw_text(
+                        display,
+                        "HEAD POSE",
+                        (panel_x + 15, pose_section_y),
+                        0.46,
+                        (0, 180, 255),
+                        1
+                    )
+
+                    draw_text(
+                        display,
+                        "3DDFA" if pose_3ddfa_ok else "FALLBACK",
+                        (panel_x + 125, pose_section_y),
+                        0.38,
+                        (70, 230, 90) if pose_3ddfa_ok else (0, 165, 255),
+                        1
+                    )
+
+                    draw_text(
+                        display,
+                        f"Pose Y/P/R   {pose_yaw:.0f} / {pose_pitch:.0f} / {pose_roll:.0f}",
+                        (panel_x + 15, pose_section_y + 28),
+                        0.34,
+                        (220, 220, 220),
+                        1
+                    )
+
+                    # =================================================
                     # DROWSINESS STATUS
                     # =================================================
 
-                    sy = y + 202
+                    # Drowsiness is intentionally placed well below HEAD POSE so the
+                    # sections never overlap.
+                    # Drowsiness is intentionally placed much lower, below HEAD POSE.
+                    sy = y + 360
+
+                    cv2.line(
+                        display,
+                        (panel_x + 10, sy - 18),
+                        (width - 20, sy - 18),
+                        (90, 90, 90),
+                        1
+                    )
 
                     draw_text(
                         display,
@@ -2202,6 +2607,11 @@ def main():
                     last_blink_count_time = -999.0
 
                     blink_count = 0
+
+                    pose_yaw = 0.0
+                    pose_pitch = 0.0
+                    pose_roll = 0.0
+                    pose_3ddfa_ok = False
 
                     state = "CALIBRATING"
 

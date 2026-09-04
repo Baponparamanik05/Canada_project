@@ -1,7 +1,11 @@
 .venv/
+3DDFA_V2/
+cnn_dataset/
+eye_dataset/
+results/
 __pycache__/
 *.pyc
-outputs/
-.vscode/
-.idea/
-.DS_Store
+
+face_landmarker.task
+
+models/*.pth
