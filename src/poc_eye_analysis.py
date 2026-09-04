@@ -32,15 +32,8 @@ FRAME_W, FRAME_H = 960, 540
 WINDOW_NAME = "Sleeping Eye Detection | Proof of Concept"
 WINDOW_W, WINDOW_H = 1400, 800
 
-CALIBRATION_SECONDS = 3.0
-SMOOTH_FRAMES = 3
-
-# Per-eye visibility protection.  An eye whose landmarks become too
-# compressed at a head angle is marked NOT VISIBLE instead of CLOSED.
-# This is critical: the hidden/weak eye must NEVER inherit the state of
-# the visible eye.
-EYE_VISIBILITY_RATIO_MIN = 0.58
-EYE_VISIBILITY_RATIO_RECOVER = 0.66
+CALIBRATION_SECONDS = 2.0
+SMOOTH_FRAMES = 5
 
 DROWSY_SECONDS = 0.8
 SLEEPING_SECONDS = 2.0
@@ -102,337 +95,100 @@ def eye_aspect_ratio_3d(landmarks, indices):
 
 
 # ============================================================
-# PER-EYE GEOMETRY / VISIBILITY
-# ============================================================
-
-def eye_geometry(landmarks, indices):
-    """Return geometry used only to decide whether THIS eye is reliable."""
-    p0 = landmarks[indices[0]]
-    p3 = landmarks[indices[3]]
-
-    # Eye corner-to-corner width.  This should remain reasonably stable
-    # when an eye opens/closes, but becomes unreliable when the eye is
-    # strongly foreshortened/occluded by a head turn.
-    w2d = _landmark_distance_2d(p0, p3)
-    w3d = _landmark_distance_3d(p0, p3)
-
-    # Distance between the two outer eye corners.  It gives a scale that
-    # changes much less than the width of the far eye during yaw.
-    l = landmarks[263]
-    r = landmarks[33]
-    inter2d = _landmark_distance_2d(l, r)
-    inter3d = _landmark_distance_3d(l, r)
-
-    if inter2d < 1e-6 or inter3d < 1e-6:
-        return 0.0, 0.0
-
-    return w2d / inter2d, w3d / inter3d
-
-
-# ============================================================
 # EYE CLASSIFIER
 # ============================================================
 
 class EyeClassifier:
-    """
-    Per-eye open/closed classifier designed for the laptop-camera POC.
-
-    Decision policy:
-    - 3D EAR ratio is the main measurement.
-    - 2D EAR ratio is a confirmation signal for a real closure.
-    - MediaPipe blink/eye blendshape is NEVER allowed to close an eye.
-    - A short temporal requirement prevents one bad landmark frame from
-      changing OPEN -> CLOSED.
-    - Hysteresis makes CLOSED -> OPEN require clear evidence of openness.
-
-    This is intentionally per-eye, so closing only the left eye does not
-    close the right eye and vice versa.
-    """
-
-    # Normalized ratios relative to the user's calibrated open-eye baseline.
-    # An open eye in the current laptop-camera tests is commonly around
-    # 0.75 or higher, while a genuinely closed eye should fall much lower.
-    CLOSE_RATIO_3D = 0.54
-    OPEN_RATIO_3D = 0.62
-
-    # 2D EAR is used only as confirmation. It is more sensitive to head pose,
-    # so it is deliberately not used alone except for a very strong collapse.
-    CLOSE_RATIO_2D = 0.70
-    STRONG_CLOSE_RATIO_2D = 0.58
-
-    CLOSE_CONFIRM_FRAMES = 2
-    OPEN_CONFIRM_FRAMES = 2
 
     def __init__(self):
         self.base_ear = 0.25
         self.base_ear_2d = 0.25
         self.base_blink = 0.0
-        self.base_eye_width_2d = 0.30
-        self.base_eye_width_3d = 0.30
 
         self.ear_history = deque(maxlen=SMOOTH_FRAMES)
         self.ear_2d_history = deque(maxlen=SMOOTH_FRAMES)
         self.blink_history = deque(maxlen=SMOOTH_FRAMES)
         self.closed_history = deque(maxlen=SMOOTH_FRAMES)
 
-        self.closed_state = False
-        self.close_votes = 0
-        self.open_votes = 0
-
-    @staticmethod
-    def _robust_open_baseline(values, minimum=0.08):
-        """
-        Estimate an open-eye baseline while reducing the effect of blinks.
-
-        Calibration is performed while the user keeps both eyes open, but
-        short blinks can still occur. We discard the lowest 20% of samples
-        before taking the median.
-        """
-        if not values:
-            return minimum
-
-        clean = [float(v) for v in values if v > 0.0]
-        if not clean:
-            return minimum
-
-        clean.sort()
-        cut = int(len(clean) * 0.20)
-
-        if len(clean) >= 10 and cut > 0:
-            clean = clean[cut:]
-
-        return max(minimum, statistics.median(clean))
-
-    def calibrate(self, ears, blinks, ears_2d=None, eye_widths_2d=None, eye_widths_3d=None):
+    def calibrate(self, ears, blinks, ears_2d=None):
         if ears:
-            self.base_ear = self._robust_open_baseline(ears)
-
+            self.base_ear = statistics.median(ears)
         if ears_2d:
-            self.base_ear_2d = self._robust_open_baseline(ears_2d)
-
+            self.base_ear_2d = statistics.median(ears_2d)
         if blinks:
-            self.base_blink = max(0.0, statistics.median(blinks))
+            self.base_blink = statistics.median(blinks)
 
-        if eye_widths_2d:
-            self.base_eye_width_2d = self._robust_open_baseline(eye_widths_2d, minimum=0.05)
+    def update(self, ear_3d, ear_2d, blink, head_pitch=0.0):
 
-        if eye_widths_3d:
-            self.base_eye_width_3d = self._robust_open_baseline(eye_widths_3d, minimum=0.05)
-
-        # Always start the calibrated eye as OPEN.
-        self.closed_state = False
-        self.close_votes = 0
-        self.open_votes = self.OPEN_CONFIRM_FRAMES
-        self.closed_history.clear()
-
-    def update(self, ear_3d, ear_2d, blink, head_pitch=0.0, eye_width_2d=None, eye_width_3d=None):
-
-        self.ear_history.append(float(ear_3d))
-        self.ear_2d_history.append(float(ear_2d))
-        self.blink_history.append(float(blink))
-
-        # ------------------------------------------------------------
-        # THIS EYE'S OWN VISIBILITY
-        # ------------------------------------------------------------
-        # Never infer one eye from the other.  When the head turns,
-        # MediaPipe can still return landmarks for the far eye even though
-        # those landmarks are no longer reliable.  Such landmarks can
-        # produce a tiny EAR and falsely report CLOSED.
-        width2d = float(eye_width_2d) if eye_width_2d is not None else self.base_eye_width_2d
-        width3d = float(eye_width_3d) if eye_width_3d is not None else self.base_eye_width_3d
-
-        width_ratio_2d = width2d / max(self.base_eye_width_2d, 1e-6)
-        width_ratio_3d = width3d / max(self.base_eye_width_3d, 1e-6)
-
-        eye_visible = (
-            width_ratio_2d >= EYE_VISIBILITY_RATIO_MIN
-            and width_ratio_3d >= EYE_VISIBILITY_RATIO_MIN
-        )
-
-        # If the geometry is borderline, require stronger evidence from
-        # both dimensions before accepting the eye as visible.
-        eye_visible_strong = (
-            width_ratio_2d >= EYE_VISIBILITY_RATIO_RECOVER
-            or width_ratio_3d >= EYE_VISIBILITY_RATIO_RECOVER
-        )
-
-        if not eye_visible and not eye_visible_strong:
-            self.closed_state = False
-            self.close_votes = 0
-            self.open_votes = self.OPEN_CONFIRM_FRAMES
-            self.closed_history.clear()
-
-            return {
-                "closed": False,
-                "visible": False,
-                "ear": statistics.median(self.ear_history),
-                "ear_2d": statistics.median(self.ear_2d_history),
-                "ear_ratio": statistics.median(self.ear_history) / max(self.base_ear, 1e-6),
-                "ear_2d_ratio": statistics.median(self.ear_2d_history) / max(self.base_ear_2d, 1e-6),
-                "blink": statistics.median(self.blink_history),
-                "blink_peak": max(self.blink_history) if self.blink_history else 0.0,
-                "ear_threshold": max(0.055, self.base_ear * self.CLOSE_RATIO_3D),
-                "open_threshold": max(0.055, self.base_ear * self.OPEN_RATIO_3D),
-                "blink_threshold": max(0.65, self.base_blink + 0.42),
-                "head_pitch": head_pitch,
-                "blink_supported": False,
-                "blink_event": False,
-                "raw_closed": False,
-                "raw_open": False,
-                "close_votes": 0,
-                "open_votes": self.OPEN_CONFIRM_FRAMES,
-                "width_ratio_2d": width_ratio_2d,
-                "width_ratio_3d": width_ratio_3d
-            }
+        self.ear_history.append(ear_3d)
+        self.ear_2d_history.append(ear_2d)
+        self.blink_history.append(blink)
 
         smooth_ear = statistics.median(self.ear_history)
         smooth_ear_2d = statistics.median(self.ear_2d_history)
         smooth_blink = statistics.median(self.blink_history)
-        # Keep the strongest recent blink signal separately. A median over
-        # several frames can hide a short first blink because most frames
-        # around the blink are still OPEN.
-        recent_blink_peak = max(self.blink_history) if self.blink_history else 0.0
 
-        # Normalize each eye against its own calibrated open-eye baseline.
-        ear_ratio = smooth_ear / max(self.base_ear, 1e-6)
-        ear_2d_ratio = smooth_ear_2d / max(self.base_ear_2d, 1e-6)
-
-        # Absolute thresholds are useful diagnostics and protect against a
-        # pathological calibration baseline.
-        close_threshold = max(0.055, self.base_ear * self.CLOSE_RATIO_3D)
-        open_threshold = max(
-            close_threshold + 0.012,
-            self.base_ear * self.OPEN_RATIO_3D
+        # 3D EAR is the primary eye-openness measurement.
+        # This is less sensitive to head pitch than 2D EAR.
+        ear_close_threshold = max(
+            0.085,
+            self.base_ear * 0.58
         )
 
-        # Blink score is diagnostic ONLY. It never controls eye state.
-        blink_threshold = max(0.65, self.base_blink + 0.42)
-
-        # ------------------------------------------------------------
-        # CLOSED EVIDENCE
-        # ------------------------------------------------------------
-        # Normal closure should reduce both geometric measurements.
-        # This prevents head-angle changes that affect only one EAR from
-        # falsely closing an eye.
-        # A real closed eye should show a substantial reduction in BOTH
-        # measurements. Requiring agreement reduces false closures caused by
-        # head tilt, perspective, or one unstable landmark set.
-        geometric_close = (
-            ear_ratio <= self.CLOSE_RATIO_3D
-            and ear_2d_ratio <= self.CLOSE_RATIO_2D
-        )
-
-        # Very strong 2D collapse can confirm closure when 3D depth is noisy,
-        # but it still requires the 3D ratio to be clearly below normal-open.
-        strong_2d_close = (
-            ear_2d_ratio <= self.STRONG_CLOSE_RATIO_2D
-            and ear_ratio <= 0.58
-        )
-
-        raw_closed = geometric_close or strong_2d_close
-
-        # ------------------------------------------------------------
-        # TRANSIENT BLINK EVENT
-        # ------------------------------------------------------------
-        # A normal blink is much shorter than drowsiness.  We use the
-        # MediaPipe blink blendshape only as a short visual event, combined
-        # with a geometric eye-opening drop.  It NEVER changes the persistent
-        # closed_state and therefore cannot start the drowsiness alarm.
-        blink_event_threshold = max(
-            0.55,
-            self.base_blink + 0.30
-        )
-
-        # Use the PEAK of the recent blink signal so the first short blink
-        # is not swallowed by the median smoothing window. Geometry is still
-        # required, so a blink score alone cannot turn the eye red.
-        blink_event = (
-            recent_blink_peak >= blink_event_threshold
-            and (
-                ear_ratio <= 0.90
-                or ear_2d_ratio <= 0.95
+        very_low_ear = (
+            smooth_ear <= max(
+                0.075,
+                self.base_ear * 0.46
             )
         )
 
-        # ------------------------------------------------------------
-        # OPEN EVIDENCE
-        # ------------------------------------------------------------
-        # Either measurement can provide recovery evidence. This is useful
-        # when head movement temporarily changes one EAR value.
-        raw_open = (
-            ear_ratio >= self.OPEN_RATIO_3D
-            or ear_2d_ratio >= 0.72
+        # Blink score is supporting evidence only.
+        # It can NEVER close an eye by itself.
+        blink_signal = (
+            smooth_blink >= max(
+                0.45,
+                self.base_blink + 0.30
+            )
         )
 
-        # Recovery band for open eyes during head pose changes. It is only
-        # used when there is no simultaneous strong closure evidence.
-        recovery_open = (
-            ear_ratio >= 0.60
-            and ear_2d_ratio >= 0.64
-            and not raw_closed
+        ear_near_close = (
+            smooth_ear <= ear_close_threshold * 1.10
         )
-        raw_open = raw_open or recovery_open
 
-        # ------------------------------------------------------------
-        # TEMPORAL HYSTERESIS
-        # ------------------------------------------------------------
-        if raw_closed:
-            self.close_votes += 1
+        blink_supported_closure = (
+            blink_signal and ear_near_close
+        )
+
+        if very_low_ear:
+            raw_closed = True
+        elif blink_supported_closure:
+            raw_closed = True
         else:
-            self.close_votes = max(0, self.close_votes - 1)
+            raw_closed = False
 
-        if raw_open:
-            self.open_votes += 1
-        else:
-            self.open_votes = max(0, self.open_votes - 1)
+        self.closed_history.append(raw_closed)
 
-        if not self.closed_state:
-            # Need several consecutive closure frames before reporting
-            # CLOSED. A single bad frame therefore cannot trigger it.
-            if self.close_votes >= self.CLOSE_CONFIRM_FRAMES:
-                self.closed_state = True
-                self.open_votes = 0
-        else:
-            # Need clear open evidence before returning to OPEN.
-            if self.open_votes >= self.OPEN_CONFIRM_FRAMES:
-                self.closed_state = False
-                self.close_votes = 0
+        votes = sum(self.closed_history)
 
-        self.closed_history.append(self.closed_state)
-
-        # The classifier state is already temporally filtered. Keep the
-        # short history for diagnostics and additional stability.
-        votes = sum(1 for x in self.closed_history if x)
         closed = (
-            votes >= max(2, len(self.closed_history) - 1)
-            if self.closed_history
-            else self.closed_state
+            votes >= max(
+                2,
+                len(self.closed_history) - 1
+            )
         )
 
         return {
             "closed": closed,
-            "visible": True,
             "ear": smooth_ear,
             "ear_2d": smooth_ear_2d,
-            "ear_ratio": ear_ratio,
-            "ear_2d_ratio": ear_2d_ratio,
             "blink": smooth_blink,
-            "blink_peak": recent_blink_peak,
-            "ear_threshold": close_threshold,
-            "open_threshold": open_threshold,
-            "blink_threshold": blink_threshold,
-            "head_pitch": head_pitch,
-            "blink_supported": (
-                smooth_blink >= blink_threshold
-                and raw_closed
+            "ear_threshold": ear_close_threshold,
+            "blink_threshold": max(
+                0.45,
+                self.base_blink + 0.30
             ),
-            "blink_event": blink_event,
-            "raw_closed": raw_closed,
-            "raw_open": raw_open,
-            "close_votes": self.close_votes,
-            "open_votes": self.open_votes,
-            "width_ratio_2d": width_ratio_2d,
-            "width_ratio_3d": width_ratio_3d
+            "head_pitch": head_pitch,
+            "blink_supported": blink_supported_closure
         }
 
 
@@ -955,29 +711,11 @@ def main():
     left_blinks = []
     right_blinks = []
 
-    left_eye_widths_2d = []
-    right_eye_widths_2d = []
-    left_eye_widths_3d = []
-    right_eye_widths_3d = []
-
     closed_start = None
 
     previous_both_closed = False
 
     blink_count = 0
-
-    # Independent blink-event tracking. Each eye is tracked separately;
-    # one eye can never create a blink event for the other eye.
-    left_eye_closed_start = None
-    right_eye_closed_start = None
-    previous_left_eye_closed = False
-    previous_right_eye_closed = False
-    previous_left_blink_event = False
-    previous_right_blink_event = False
-    last_blink_count_time = -999.0
-    BLINK_MIN_SECONDS = 0.04
-    BLINK_MAX_SECONDS = 0.75
-    BLINK_MERGE_SECONDS = 0.25
 
     state = "CALIBRATING"
 
@@ -998,11 +736,11 @@ def main():
     print("=" * 60)
 
     print(
-        "SLEEPING EYE DETECTION V6 - INDEPENDENT EYE ANGLE SAFE"
+        "SLEEPING EYE DETECTION V5"
     )
 
     print(
-        "Keep BOTH eyes OPEN for 3 seconds."
+        "Keep BOTH eyes OPEN for 2 seconds."
     )
 
     print(
@@ -1011,11 +749,7 @@ def main():
     )
 
     print(
-        "Both independently visible eyes closed > 2.0s = SLEEPING"
-    )
-
-    print(
-        "A poorly visible eye at a head angle is NOT VISIBLE, never CLOSED."
+        "Both eyes closed > 2.0s = SLEEPING"
     )
 
     print(
@@ -1158,16 +892,6 @@ def main():
                     )
 
                     # ------------------------------------------------
-                    # PER-EYE VISIBILITY GEOMETRY
-                    # ------------------------------------------------
-                    left_width_2d, left_width_3d = eye_geometry(
-                        landmarks, LEFT_EYE
-                    )
-                    right_width_2d, right_width_3d = eye_geometry(
-                        landmarks, RIGHT_EYE
-                    )
-
-                    # ------------------------------------------------
                     # BLINK
                     # ------------------------------------------------
 
@@ -1208,11 +932,6 @@ def main():
                         right_blinks.append(
                             right_blink
                         )
-
-                        left_eye_widths_2d.append(left_width_2d)
-                        right_eye_widths_2d.append(right_width_2d)
-                        left_eye_widths_3d.append(left_width_3d)
-                        right_eye_widths_3d.append(right_width_3d)
 
                         if (
                             now -
@@ -1274,9 +993,7 @@ def main():
                                 left_ear,
                                 left_ear_2d,
                                 left_blink,
-                                head_pitch,
-                                left_width_2d,
-                                left_width_3d
+                                head_pitch
                             )
                         )
 
@@ -1285,129 +1002,74 @@ def main():
                                 right_ear,
                                 right_ear_2d,
                                 right_blink,
-                                head_pitch,
-                                right_width_2d,
-                                right_width_3d
+                                head_pitch
                             )
                         )
 
                         # ------------------------------------------------
-                        # FAST, INDEPENDENT PER-EYE BLINK COUNTING
+                        # BOTH EYES CLOSED
                         # ------------------------------------------------
-                        # Do NOT wait for the persistent CLOSED state to
-                        # transition back to OPEN. A very fast blink may last
-                        # only a few camera frames, while the eye classifier
-                        # intentionally requires several frames before it
-                        # changes its persistent CLOSED state.
-                        #
-                        # Therefore the blink counter uses the short
-                        # blink_event generated by each eye independently.
-                        # A rising edge = one blink. A cooldown merges a
-                        # simultaneous left+right blink into one event.
-                        #
-                        # Crucially, LEFT and RIGHT are completely separate:
-                        # one eye can never create a blink for the other eye.
 
-                        left_visible = left_data.get("visible", False)
-                        right_visible = right_data.get("visible", False)
-
-                        left_closed_now = (
-                            left_visible and left_data["closed"]
-                        )
-                        right_closed_now = (
-                            right_visible and right_data["closed"]
-                        )
-
-                        left_blink_event = (
-                            left_visible
-                            and left_data.get("blink_event", False)
-                        )
-                        right_blink_event = (
-                            right_visible
-                            and right_data.get("blink_event", False)
-                        )
-
-                        # Count the LEFT blink immediately when the blink
-                        # event starts. This works even for a very fast blink.
-                        if (
-                            left_blink_event
-                            and not previous_left_blink_event
-                        ):
-                            if (
-                                now - last_blink_count_time
-                                >= BLINK_MERGE_SECONDS
-                            ):
-                                blink_count += 1
-                                last_blink_count_time = now
-
-                        # Count the RIGHT blink independently.
-                        if (
-                            right_blink_event
-                            and not previous_right_blink_event
-                        ):
-                            if (
-                                now - last_blink_count_time
-                                >= BLINK_MERGE_SECONDS
-                            ):
-                                blink_count += 1
-                                last_blink_count_time = now
-
-                        # Keep the closure timers for drowsiness/alarm logic.
-                        # These timers are NOT used for blink counting.
-                        if (
-                            left_closed_now
-                            and not previous_left_eye_closed
-                        ):
-                            left_eye_closed_start = now
-
-                        if (
-                            right_closed_now
-                            and not previous_right_eye_closed
-                        ):
-                            right_eye_closed_start = now
-
-                        # Clear closure timers when the corresponding eye
-                        # reopens. Long closures remain drowsiness events,
-                        # not blink events.
-                        if (
-                            previous_left_eye_closed
-                            and not left_closed_now
-                        ):
-                            left_eye_closed_start = None
-
-                        if (
-                            previous_right_eye_closed
-                            and not right_closed_now
-                        ):
-                            right_eye_closed_start = None
-
-                        # ------------------------------------------------
-                        # BOTH EYES CLOSED -- STILL ONLY WHEN BOTH ARE
-                        # INDEPENDENTLY VISIBLE AND INDEPENDENTLY CLOSED
-                        # ------------------------------------------------
                         both_closed = (
-                            left_visible
-                            and right_visible
-                            and left_data["closed"]
-                            and right_data["closed"]
+                            left_data["closed"]
+                            and
+                            right_data["closed"]
                         )
 
-                        if both_closed and not previous_both_closed:
+                        # ------------------------------------------------
+                        # START CLOSURE
+                        # ------------------------------------------------
+
+                        if (
+                            both_closed
+                            and
+                            not previous_both_closed
+                        ):
+
                             closed_start = now
+
                             alarm_manager.new_closure()
+
+                        # ------------------------------------------------
+                        # CLOSURE TIMER
+                        # ------------------------------------------------
 
                         closed_duration = (
                             now - closed_start
-                            if closed_start is not None
-                            else 0.0
+                            if
+                            closed_start is not None
+                            else
+                            0.0
                         )
+
+                        # ------------------------------------------------
+                        # EYES OPEN AGAIN
+                        # ------------------------------------------------
 
                         if (
                             not both_closed
-                            and previous_both_closed
-                            and closed_start is not None
+                            and
+                            previous_both_closed
+                            and
+                            closed_start is not None
                         ):
+
+                            duration = (
+                                now -
+                                closed_start
+                            )
+
+                            if (
+                                0.08
+                                <= duration
+                                <
+                                DROWSY_SECONDS
+                            ):
+
+                                blink_count += 1
+
                             closed_start = None
+
                             alarm_manager.new_closure()
 
                         # =================================================
@@ -1450,24 +1112,9 @@ def main():
 
                         else:
 
-                            # A short blink is shown as BLINK, but because
-                            # blink_event does not change `both_closed`, it
-                            # cannot start the drowsiness/alarm timer.
-                            if (
-                                left_data.get("blink_event", False)
-                                or
-                                right_data.get("blink_event", False)
-                            ):
-                                state = "BLINK"
-                            else:
-                                state = "NORMAL"
+                            state = "NORMAL"
 
                             alarm_manager.new_closure()
-
-                        previous_left_eye_closed = left_closed_now
-                        previous_right_eye_closed = right_closed_now
-                        previous_left_blink_event = left_blink_event
-                        previous_right_blink_event = right_blink_event
 
                         previous_both_closed = (
                             both_closed
@@ -1511,25 +1158,21 @@ def main():
 
                     else:
 
-                        if not left_data.get("visible", True):
-                            left_color = (0, 215, 255)
-                        else:
-                            left_visual_closed = (
-                                left_data["closed"]
-                                or
-                                left_data.get("blink_event", False)
-                            )
-                            left_color = (0, 0, 255) if left_visual_closed else (0, 255, 0)
+                        left_color = (
+                            (0, 0, 255)
+                            if
+                            left_data["closed"]
+                            else
+                            (0, 255, 0)
+                        )
 
-                        if not right_data.get("visible", True):
-                            right_color = (0, 215, 255)
-                        else:
-                            right_visual_closed = (
-                                right_data["closed"]
-                                or
-                                right_data.get("blink_event", False)
-                            )
-                            right_color = (0, 0, 255) if right_visual_closed else (0, 255, 0)
+                        right_color = (
+                            (0, 0, 255)
+                            if
+                            right_data["closed"]
+                            else
+                            (0, 255, 0)
+                        )
 
                     # ------------------------------------------------
                     # DRAW EYE BOXES
@@ -1644,7 +1287,7 @@ def main():
 
                 draw_text(
                     display,
-                    "3D EAR + BLINK  |  ROBUST MODE",
+                    "EAR + BLINK  |  FAST MODE",
                     (18, 52),
                     0.32,
                     (150, 150, 150),
@@ -1783,23 +1426,31 @@ def main():
                 elif left_data and right_data:
 
                     ls = (
-                        "CLOSED" if left_data["closed"]
-                        else ("OPEN" if left_data.get("visible", True) else "NOT VISIBLE")
+                        "CLOSED"
+                        if left_data["closed"]
+                        else
+                        "OPEN"
                     )
 
                     rs = (
-                        "CLOSED" if right_data["closed"]
-                        else ("OPEN" if right_data.get("visible", True) else "NOT VISIBLE")
+                        "CLOSED"
+                        if right_data["closed"]
+                        else
+                        "OPEN"
                     )
 
                     lc = (
-                        (0, 0, 255) if left_data["closed"]
-                        else ((0, 215, 255) if not left_data.get("visible", True) else (70, 230, 90))
+                        (0, 0, 255)
+                        if left_data["closed"]
+                        else
+                        (70, 230, 90)
                     )
 
                     rc = (
-                        (0, 0, 255) if right_data["closed"]
-                        else ((0, 215, 255) if not right_data.get("visible", True) else (70, 230, 90))
+                        (0, 0, 255)
+                        if right_data["closed"]
+                        else
+                        (70, 230, 90)
                     )
 
                     # ------------------------------------------------
@@ -1871,7 +1522,7 @@ def main():
                     draw_text(
                         display,
                         (
-                            f"EAR close thresholds "
+                            f"EAR thresholds "
                             f"{left_data['ear_threshold']:.3f} / "
                             f"{right_data['ear_threshold']:.3f}"
                         ),
@@ -1884,43 +1535,11 @@ def main():
                         1
                     )
 
-                    draw_text(
-                        display,
-                        (
-                            f"EAR ratio "
-                            f"{left_data['ear_ratio']:.2f} / "
-                            f"{right_data['ear_ratio']:.2f}"
-                        ),
-                        (
-                            panel_x + 15,
-                            y + 148
-                        ),
-                        0.30,
-                        (155, 155, 155),
-                        1
-                    )
-
-                    draw_text(
-                        display,
-                        (
-                            f"Eye visibility "
-                            f"{left_data['width_ratio_2d']:.2f} / "
-                            f"{right_data['width_ratio_2d']:.2f}"
-                        ),
-                        (
-                            panel_x + 15,
-                            y + 168
-                        ),
-                        0.29,
-                        (155, 155, 155),
-                        1
-                    )
-
                     # =================================================
                     # DROWSINESS STATUS
                     # =================================================
 
-                    sy = y + 202
+                    sy = y + 165
 
                     draw_text(
                         display,
@@ -2140,18 +1759,11 @@ def main():
                     & 0xFF
                 )
 
-                # Treat the window X button as a normal quit request too.
-                try:
-                    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                        key = ord("q")
-                except cv2.error:
-                    key = ord("q")
-
                 # =================================================
                 # QUIT
                 # =================================================
 
-                if key in (ord("q"), ord("Q"), 27):
+                if key == ord("q"):
 
                     break
 
@@ -2177,11 +1789,6 @@ def main():
                     left_blinks.clear()
                     right_blinks.clear()
 
-                    left_eye_widths_2d.clear()
-                    right_eye_widths_2d.clear()
-                    left_eye_widths_3d.clear()
-                    right_eye_widths_3d.clear()
-
                     left_classifier = (
                         EyeClassifier()
                     )
@@ -2193,13 +1800,6 @@ def main():
                     closed_start = None
 
                     previous_both_closed = False
-                    left_eye_closed_start = None
-                    right_eye_closed_start = None
-                    previous_left_eye_closed = False
-                    previous_right_eye_closed = False
-                    previous_left_blink_event = False
-                    previous_right_blink_event = False
-                    last_blink_count_time = -999.0
 
                     blink_count = 0
 
